@@ -221,7 +221,11 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	shouldPreserve := func(header *types.Header) bool {
 		return false
 	}
-	eth.blockchain, err = core.NewBlockChain(chainDb, cacheConfig, config.Genesis, &overrides, eth.engine, vmConfig, shouldPreserve, &config.TransactionHistory)
+	if config.ParallelEVM.Enable {
+		eth.blockchain, err = core.NewParallelBlockChain(chainDb, cacheConfig, config.Genesis, &overrides, eth.engine, vmConfig, shouldPreserve, &config.TransactionHistory, config.ParallelEVM.SpeculativeProcesses)
+	} else {
+		eth.blockchain, err = core.NewBlockChain(chainDb, cacheConfig, config.Genesis, &overrides, eth.engine, vmConfig, shouldPreserve, &config.TransactionHistory)
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/blockstm"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
 	"github.com/ethereum/go-ethereum/core/stateless"
@@ -36,6 +37,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/metrics"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/trienode"
@@ -113,6 +115,14 @@ type StateDB struct {
 	// can be merged into a single one which is equivalent from database's
 	// perspective. This map is populated at the transaction boundaries.
 	mutations map[common.Address]*mutation
+
+	// Block-stm related fields
+	mvHashmap    *blockstm.MVHashMap
+	incarnation  int
+	readMap      map[blockstm.Key]blockstm.ReadDescriptor
+	writeMap     map[blockstm.Key]blockstm.WriteDescriptor
+	revertedKeys map[blockstm.Key]struct{}
+	dep          int
 
 	// DB error.
 	// State objects are used by the consensus core and VM which are
@@ -196,9 +206,286 @@ func New(root common.Hash, db Database, snaps *snapshot.Tree) (*StateDB, error) 
 	return sdb, nil
 }
 
+func NewWithMVHashmap(root common.Hash, db Database, snaps *snapshot.Tree, mvhm *blockstm.MVHashMap) (*StateDB, error) {
+	if sdb, err := New(root, db, snaps); err != nil {
+		return nil, err
+	} else {
+		sdb.mvHashmap = mvhm
+		sdb.dep = -1
+
+		return sdb, nil
+	}
+}
+
+func (s *StateDB) SetMVHashmap(mvhm *blockstm.MVHashMap) {
+	s.mvHashmap = mvhm
+	s.dep = -1
+}
+
+func (s *StateDB) GetMVHashmap() *blockstm.MVHashMap {
+	return s.mvHashmap
+}
+
+func (s *StateDB) MVWriteList() []blockstm.WriteDescriptor {
+	writes := make([]blockstm.WriteDescriptor, 0, len(s.writeMap))
+
+	for _, v := range s.writeMap {
+		if _, ok := s.revertedKeys[v.Path]; !ok {
+			writes = append(writes, v)
+		}
+	}
+
+	return writes
+}
+
+func (s *StateDB) MVFullWriteList() []blockstm.WriteDescriptor {
+	writes := make([]blockstm.WriteDescriptor, 0, len(s.writeMap))
+
+	for _, v := range s.writeMap {
+		writes = append(writes, v)
+	}
+
+	return writes
+}
+
+func (s *StateDB) MVReadMap() map[blockstm.Key]blockstm.ReadDescriptor {
+	return s.readMap
+}
+
+func (s *StateDB) MVReadList() []blockstm.ReadDescriptor {
+	reads := make([]blockstm.ReadDescriptor, 0, len(s.readMap))
+
+	for _, v := range s.MVReadMap() {
+		reads = append(reads, v)
+	}
+
+	return reads
+}
+
+func (s *StateDB) ensureReadMap() {
+	if s.readMap == nil {
+		s.readMap = make(map[blockstm.Key]blockstm.ReadDescriptor)
+	}
+}
+
+func (s *StateDB) ensureWriteMap() {
+	if s.writeMap == nil {
+		s.writeMap = make(map[blockstm.Key]blockstm.WriteDescriptor)
+	}
+}
+
+func (s *StateDB) ClearReadMap() {
+	s.readMap = make(map[blockstm.Key]blockstm.ReadDescriptor)
+}
+
+func (s *StateDB) ClearWriteMap() {
+	s.writeMap = make(map[blockstm.Key]blockstm.WriteDescriptor)
+}
+
+func (s *StateDB) HadInvalidRead() bool {
+	return s.dep >= 0
+}
+
+func (s *StateDB) DepTxIndex() int {
+	return s.dep
+}
+
+func (s *StateDB) SetIncarnation(inc int) {
+	s.incarnation = inc
+}
+
 // SetLogger sets the logger for account update hooks.
 func (s *StateDB) SetLogger(l *tracing.Hooks) {
 	s.logger = l
+}
+
+type StorageVal[T any] struct {
+	Value *T
+}
+
+func MVRead[T any](s *StateDB, k blockstm.Key, defaultV T, readStorage func(s *StateDB) T) (v T) {
+	if s.mvHashmap == nil {
+		return readStorage(s)
+	}
+
+	s.ensureReadMap()
+
+	if s.writeMap != nil {
+		if _, ok := s.writeMap[k]; ok {
+			return readStorage(s)
+		}
+	}
+
+	if !k.IsAddress() {
+		// If we are reading subpath from a deleted account, return default value instead of reading from MVHashmap
+		addr := k.GetAddress()
+		if s.getStateObject(addr) == nil {
+			return defaultV
+		}
+	}
+
+	res := s.mvHashmap.Read(k, s.txIndex)
+
+	var rd blockstm.ReadDescriptor
+
+	rd.V = blockstm.Version{
+		TxnIndex:    res.DepIdx(),
+		Incarnation: res.Incarnation(),
+	}
+
+	rd.Path = k
+
+	switch res.Status() {
+	case blockstm.MVReadResultDone:
+		{
+			v = readStorage(res.Value().(*StateDB))
+			rd.Kind = blockstm.ReadKindMap
+		}
+	case blockstm.MVReadResultDependency:
+		{
+			s.dep = res.DepIdx()
+
+			panic("Found dependency")
+		}
+	case blockstm.MVReadResultNone:
+		{
+			v = readStorage(s)
+			rd.Kind = blockstm.ReadKindStorage
+		}
+	default:
+		return defaultV
+	}
+
+	// TODO: I assume we don't want to overwrite an existing read because this could - for example - change a storage
+	//  read to map if the same value is read multiple times.
+	if _, ok := s.readMap[k]; !ok {
+		s.readMap[k] = rd
+	}
+
+	return
+}
+
+func MVWrite(s *StateDB, k blockstm.Key) {
+	if s.mvHashmap != nil {
+		s.ensureWriteMap()
+		s.writeMap[k] = blockstm.WriteDescriptor{
+			Path: k,
+			V:    s.Version(),
+			Val:  s,
+		}
+	}
+}
+
+func RevertWrite(s *StateDB, k blockstm.Key) {
+	s.revertedKeys[k] = struct{}{}
+}
+
+func MVWritten(s *StateDB, k blockstm.Key) bool {
+	if s.mvHashmap == nil || s.writeMap == nil {
+		return false
+	}
+
+	_, ok := s.writeMap[k]
+
+	return ok
+}
+
+// FlushMVWriteSet applies entries in the write set to MVHashMap. Note that this function does not clear the write set.
+func (s *StateDB) FlushMVWriteSet() {
+	if s.mvHashmap != nil && s.writeMap != nil {
+		s.mvHashmap.FlushMVWriteSet(s.MVFullWriteList())
+	}
+}
+
+// ApplyMVWriteSet applies entries in a given write set to StateDB. Note that this function does not change MVHashMap nor write set
+// of the current StateDB.
+func (s *StateDB) ApplyMVWriteSet(writes []blockstm.WriteDescriptor) {
+	for i := range writes {
+		path := writes[i].Path
+		sr := writes[i].Val.(*StateDB)
+
+		if path.IsState() {
+			addr := path.GetAddress()
+			stateKey := path.GetStateKey()
+			state := sr.GetState(addr, stateKey)
+			s.SetState(addr, stateKey, state)
+		} else if path.IsAddress() {
+			continue
+		} else {
+			addr := path.GetAddress()
+
+			switch path.GetSubpath() {
+			case BalancePath:
+				s.SetBalance(addr, sr.GetBalance(addr), tracing.BalanceChangeUnspecified)
+			case NoncePath:
+				s.SetNonce(addr, sr.GetNonce(addr))
+			case CodePath:
+				s.SetCode(addr, sr.GetCode(addr))
+			case SuicidePath:
+				stateObject := sr.getDeletedStateObject(addr)
+				if stateObject != nil && stateObject.deleted {
+					s.SelfDestruct(addr)
+				}
+			default:
+				panic(fmt.Errorf("unknown key type: %d", path.GetSubpath()))
+			}
+		}
+	}
+}
+
+type DumpStruct struct {
+	TxIdx  int
+	TxInc  int
+	VerIdx int
+	VerInc int
+	Path   []byte
+	Op     string
+}
+
+// GetReadMapDump gets readMap Dump of format: "TxIdx, Inc, Path, Read"
+func (s *StateDB) GetReadMapDump() []DumpStruct {
+	readList := s.MVReadList()
+	res := make([]DumpStruct, 0, len(readList))
+
+	for _, val := range readList {
+		temp := &DumpStruct{
+			TxIdx:  s.txIndex,
+			TxInc:  s.incarnation,
+			VerIdx: val.V.TxnIndex,
+			VerInc: val.V.Incarnation,
+			Path:   val.Path[:],
+			Op:     "Read\n",
+		}
+		res = append(res, *temp)
+	}
+
+	return res
+}
+
+// GetWriteMapDump gets writeMap Dump of format: "TxIdx, Inc, Path, Write"
+func (s *StateDB) GetWriteMapDump() []DumpStruct {
+	writeList := s.MVReadList()
+	res := make([]DumpStruct, 0, len(writeList))
+
+	for _, val := range writeList {
+		temp := &DumpStruct{
+			TxIdx:  s.txIndex,
+			TxInc:  s.incarnation,
+			VerIdx: val.V.TxnIndex,
+			VerInc: val.V.Incarnation,
+			Path:   val.Path[:],
+			Op:     "Write\n",
+		}
+		res = append(res, *temp)
+	}
+
+	return res
+}
+
+// AddEmptyMVHashMap adds empty MVHashMap to StateDB
+func (s *StateDB) AddEmptyMVHashMap() {
+	mvh := blockstm.MakeMVHashMap()
+	s.mvHashmap = mvh
 }
 
 // StartPrefetcher initializes a new trie prefetcher to pull in nodes from the
@@ -329,6 +616,19 @@ func (s *StateDB) Empty(addr common.Address) bool {
 	return so == nil || so.empty()
 }
 
+// Create a unique path for special fields (e.g. balance, code) in a state object.
+// func subPath(prefix []byte, s uint8) [blockstm.KeyLength]byte {
+// 	path := append(prefix, common.Hash{}.Bytes()...) // append a full empty hash to avoid collision with storage state
+// 	path = append(path, s)                           // append the special field identifier
+
+// 	return path
+// }
+
+const BalancePath = 1
+const NoncePath = 2
+const CodePath = 3
+const SuicidePath = 4
+
 // GetBalance retrieves the balance from the given address or 0 if object not found
 func (s *StateDB) GetBalance(addr common.Address) *uint256.Int {
 	stateObject := s.getStateObject(addr)
@@ -363,47 +663,68 @@ func (s *StateDB) TxIndex() int {
 	return s.txIndex
 }
 
-func (s *StateDB) GetCode(addr common.Address) []byte {
-	stateObject := s.getStateObject(addr)
-	if stateObject != nil {
-		return stateObject.Code()
+func (s *StateDB) Version() blockstm.Version {
+	return blockstm.Version{
+		TxnIndex:    s.txIndex,
+		Incarnation: s.incarnation,
 	}
-	return nil
+}
+
+func (s *StateDB) GetCode(addr common.Address) []byte {
+	return MVRead(s, blockstm.NewSubpathKey(addr, CodePath), nil, func(s *StateDB) []byte {
+		stateObject := s.getStateObject(addr)
+		if stateObject != nil {
+			return stateObject.Code()
+		}
+
+		return nil
+	})
 }
 
 func (s *StateDB) GetCodeSize(addr common.Address) int {
-	stateObject := s.getStateObject(addr)
-	if stateObject != nil {
-		return stateObject.CodeSize()
-	}
-	return 0
+	return MVRead(s, blockstm.NewSubpathKey(addr, CodePath), 0, func(s *StateDB) int {
+		stateObject := s.getStateObject(addr)
+		if stateObject != nil {
+			return stateObject.CodeSize()
+		}
+
+		return 0
+	})
 }
 
 func (s *StateDB) GetCodeHash(addr common.Address) common.Hash {
-	stateObject := s.getStateObject(addr)
-	if stateObject != nil {
+	return MVRead(s, blockstm.NewSubpathKey(addr, CodePath), common.Hash{}, func(s *StateDB) common.Hash {
+		stateObject := s.getStateObject(addr)
+		if stateObject == nil {
+			return common.Hash{}
+		}
+
 		return common.BytesToHash(stateObject.CodeHash())
-	}
-	return common.Hash{}
+	})
 }
 
-// GetState retrieves the value associated with the specific key.
+// GetState retrieves a value from the given account's storage trie.
 func (s *StateDB) GetState(addr common.Address, hash common.Hash) common.Hash {
-	stateObject := s.getStateObject(addr)
-	if stateObject != nil {
-		return stateObject.GetState(hash)
-	}
-	return common.Hash{}
+	return MVRead(s, blockstm.NewStateKey(addr, hash), common.Hash{}, func(s *StateDB) common.Hash {
+		stateObject := s.getStateObject(addr)
+		if stateObject != nil {
+			return stateObject.GetState(hash)
+		}
+
+		return common.Hash{}
+	})
 }
 
-// GetCommittedState retrieves the value associated with the specific key
-// without any mutations caused in the current execution.
+// GetCommittedState retrieves a value from the given account's committed storage trie.
 func (s *StateDB) GetCommittedState(addr common.Address, hash common.Hash) common.Hash {
-	stateObject := s.getStateObject(addr)
-	if stateObject != nil {
-		return stateObject.GetCommittedState(hash)
-	}
-	return common.Hash{}
+	return MVRead(s, blockstm.NewStateKey(addr, hash), common.Hash{}, func(s *StateDB) common.Hash {
+		stateObject := s.getStateObject(addr)
+		if stateObject != nil {
+			return stateObject.GetCommittedState(hash)
+		}
+
+		return common.Hash{}
+	})
 }
 
 // Database retrieves the low level database supporting the lower level trie ops.
@@ -442,7 +763,9 @@ func (s *StateDB) SubBalance(addr common.Address, amount *uint256.Int, reason tr
 func (s *StateDB) SetBalance(addr common.Address, amount *uint256.Int, reason tracing.BalanceChangeReason) {
 	stateObject := s.getOrNewStateObject(addr)
 	if stateObject != nil {
+		stateObject = s.mvRecordWritten(stateObject)
 		stateObject.SetBalance(amount, reason)
+		MVWrite(s, blockstm.NewSubpathKey(addr, BalancePath))
 	}
 }
 
@@ -646,6 +969,90 @@ func (s *StateDB) getStateObject(addr common.Address) *stateObject {
 	return obj
 }
 
+// getDeletedStateObject is similar to getStateObject, but instead of returning
+// nil for a deleted state object, it returns the actual object with the deleted
+// flag set. This is needed by the state journal to revert to the correct s-
+// destructed object instead of wiping all knowledge about the state object.
+func (s *StateDB) getDeletedStateObject(addr common.Address) *stateObject {
+	return MVRead(s, blockstm.NewAddressKey(addr), nil, func(s *StateDB) *stateObject {
+		// Prefer live objects if any is available
+		if obj := s.stateObjects[addr]; obj != nil {
+			return obj
+		}
+		// If no live objects are available, attempt to use snapshots
+		var data *types.StateAccount
+
+		if s.snap != nil { // nolint
+			start := time.Now()
+			acc, err := s.snap.Account(crypto.HashData(crypto.NewKeccakState(), addr.Bytes()))
+
+			if metrics.Enabled {
+				s.SnapshotAccountReads += time.Since(start)
+			}
+
+			if err == nil {
+				if acc == nil {
+					return nil
+				}
+
+				data = &types.StateAccount{
+					Nonce:    acc.Nonce,
+					Balance:  acc.Balance,
+					CodeHash: acc.CodeHash,
+					Root:     common.BytesToHash(acc.Root),
+				}
+				if len(data.CodeHash) == 0 {
+					data.CodeHash = types.EmptyCodeHash.Bytes()
+				}
+
+				if data.Root == (common.Hash{}) {
+					data.Root = types.EmptyRootHash
+				}
+			}
+		}
+		// If snapshot unavailable or reading from it failed, load from the database
+		if data == nil {
+			start := time.Now()
+
+			var err error
+			data, err = s.trie.GetAccount(addr)
+
+			if metrics.Enabled {
+				s.AccountReads += time.Since(start)
+			}
+
+			if err != nil {
+				s.setError(fmt.Errorf("getDeleteStateObject (%x) error: %w", addr.Bytes(), err))
+				return nil
+			}
+
+			if data == nil {
+				return nil
+			}
+		}
+		// If snapshot unavailable or reading from it failed, load from the database
+		if data == nil {
+			start := time.Now()
+			var err error
+			data, err = s.trie.GetAccount(addr)
+			if metrics.Enabled {
+				s.AccountReads += time.Since(start)
+			}
+			if err != nil {
+				s.setError(fmt.Errorf("getDeleteStateObject (%x) error: %w", addr.Bytes(), err))
+				return nil
+			}
+			if data == nil {
+				return nil
+			}
+		}
+		// Insert into the live set
+		obj := newObject(s, addr, data)
+		s.setStateObject(obj)
+		return obj
+	})
+}
+
 func (s *StateDB) setStateObject(object *stateObject) {
 	s.stateObjects[object.Address()] = object
 }
@@ -657,6 +1064,28 @@ func (s *StateDB) getOrNewStateObject(addr common.Address) *stateObject {
 		obj = s.createObject(addr)
 	}
 	return obj
+}
+
+// mvRecordWritten checks whether a state object is already present in the current MV writeMap.
+// If yes, it returns the object directly.
+// If not, it clones the object and inserts it into the writeMap before returning it.
+func (s *StateDB) mvRecordWritten(object *stateObject) *stateObject {
+	if s.mvHashmap == nil {
+		return object
+	}
+
+	addrKey := blockstm.NewAddressKey(object.Address())
+
+	if MVWritten(s, addrKey) {
+		return object
+	}
+
+	// Deepcopy is needed to ensure that objects are not written by multiple transactions at the same time, because
+	// the input state object can come from a different transaction.
+	s.setStateObject(object.deepCopy(s))
+	MVWrite(s, addrKey)
+
+	return s.stateObjects[object.Address()]
 }
 
 // createObject creates a new state object. The assumption is held there is no

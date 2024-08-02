@@ -29,7 +29,14 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
+)
+
+var (
+	ExtraVanityLength = 32 // Fixed number of extra-data prefix bytes reserved for signer vanity
+	ExtraSealLength   = 65 // Fixed number of extra-data suffix bytes reserved for signer seal
 )
 
 // A BlockNonce is a 64-bit hash which proves (combined with the
@@ -94,6 +101,16 @@ type Header struct {
 
 	// ParentBeaconRoot was added by EIP-4788 and is ignored in legacy headers.
 	ParentBeaconRoot *common.Hash `json:"parentBeaconBlockRoot" rlp:"optional"`
+}
+
+// Used for Encoding and Decoding of the Extra Data Field
+type BlockExtraData struct {
+	ValidatorBytes []byte
+
+	// length of TxDependency          ->   n (n = number of transactions in the block)
+	// length of TxDependency[i]       ->   k (k = a whole number)
+	// k elements in TxDependency[i]   ->   transaction indexes on which transaction i is dependent on
+	TxDependency [][]uint64
 }
 
 // field type overrides for gencodec
@@ -373,6 +390,40 @@ func (b *Block) TxHash() common.Hash      { return b.header.TxHash }
 func (b *Block) ReceiptHash() common.Hash { return b.header.ReceiptHash }
 func (b *Block) UncleHash() common.Hash   { return b.header.UncleHash }
 func (b *Block) Extra() []byte            { return common.CopyBytes(b.header.Extra) }
+
+func (b *Block) GetTxDependency() [][]uint64 {
+	if len(b.header.Extra) < ExtraVanityLength+ExtraSealLength {
+		log.Error("length of extra less is than vanity and seal")
+		return nil
+	}
+
+	var blockExtraData BlockExtraData
+	if err := rlp.DecodeBytes(b.header.Extra[ExtraVanityLength:len(b.header.Extra)-ExtraSealLength], &blockExtraData); err != nil {
+		log.Debug("error while decoding block extra data", "err", err)
+		return nil
+	}
+
+	return blockExtraData.TxDependency
+}
+
+func (h *Header) GetValidatorBytes(chainConfig *params.ChainConfig) []byte {
+	if !chainConfig.IsCancun(h.Number, h.Time) {
+		return h.Extra[ExtraVanityLength : len(h.Extra)-ExtraSealLength]
+	}
+
+	if len(h.Extra) < ExtraVanityLength+ExtraSealLength {
+		log.Error("length of extra less is than vanity and seal")
+		return nil
+	}
+
+	var blockExtraData BlockExtraData
+	if err := rlp.DecodeBytes(h.Extra[ExtraVanityLength:len(h.Extra)-ExtraSealLength], &blockExtraData); err != nil {
+		log.Debug("error while decoding block extra data", "err", err)
+		return nil
+	}
+
+	return blockExtraData.ValidatorBytes
+}
 
 func (b *Block) BaseFee() *big.Int {
 	if b.header.BaseFee == nil {

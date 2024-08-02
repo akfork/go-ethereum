@@ -77,6 +77,11 @@ type stateObject struct {
 	// account is still accessible in the scope of same transaction.
 	selfDestructed bool
 
+	// Flag whether the account was marked as deleted. A self-destructed account
+	// or an account that is considered as empty will be marked as deleted at
+	// the end of transaction and no longer accessible anymore.
+	deleted bool
+
 	// This is an EIP-6780 flag indicating whether the object is eligible for
 	// self-destruct according to EIP-6780. The flag could be set either when
 	// the contract is just created within the current transaction, or when the
@@ -539,6 +544,7 @@ func (s *stateObject) deepCopy(db *StateDB) *stateObject {
 		dirtyCode:          s.dirtyCode,
 		selfDestructed:     s.selfDestructed,
 		newContract:        s.newContract,
+		deleted:            s.deleted,
 	}
 	if s.trie != nil {
 		obj.trie = db.db.CopyTrie(s.trie)

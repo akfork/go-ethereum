@@ -256,6 +256,7 @@ type BlockChain struct {
 	validator  Validator // Block and state validator interface
 	prefetcher Prefetcher
 	processor  Processor // Block transaction processor interface
+	parallelProcessor Processor // Parallel block transaction processor interface
 	forker     *ForkChoice
 	vmConfig   vm.Config
 	logger     *tracing.Hooks
@@ -464,6 +465,26 @@ func NewBlockChain(db ethdb.Database, cacheConfig *CacheConfig, genesis *Genesis
 	if txLookupLimit != nil {
 		bc.txIndexer = newTxIndexer(*txLookupLimit, bc)
 	}
+	return bc, nil
+}
+
+func NewParallelBlockChain(db ethdb.Database, cacheConfig *CacheConfig, genesis *Genesis, overrides *ChainOverrides, engine consensus.Engine, vmConfig vm.Config, shouldPreserve func(header *types.Header) bool, txLookupLimit *uint64, numprocs int) (*BlockChain, error) {
+	bc, err := NewBlockChain(db, cacheConfig, genesis, overrides, engine, vmConfig, shouldPreserve, txLookupLimit)
+	if err!= nil {
+		return nil, err
+	}
+	// Open trie database with provided config
+	triedb := bc.triedb
+
+	chainConfig, _, genesisErr := SetupGenesisBlockWithOverride(db, triedb, genesis, overrides)
+
+	if _, ok := genesisErr.(*params.ConfigCompatError); genesisErr != nil && !ok {
+		return nil, genesisErr
+	}
+
+	bc.parallelProcessor = NewParallelStateProcessor(chainConfig, bc.hc)
+	bc.hc.parallelSpeculativeProcesses = numprocs
+
 	return bc, nil
 }
 

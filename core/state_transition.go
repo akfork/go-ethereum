@@ -17,6 +17,7 @@
 package core
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"math/big"
@@ -184,6 +185,13 @@ func ApplyMessage(evm *vm.EVM, msg *Message, gp *GasPool) (*ExecutionResult, err
 	return NewStateTransition(evm, msg, gp).TransitionDb()
 }
 
+func ApplyMessageNoFeeBurnOrTip(evm *vm.EVM, msg Message, gp *GasPool, interruptCtx context.Context) (*ExecutionResult, error) {
+	st := NewStateTransition(evm, &msg, gp)
+	st.noFeeBurnAndTip = true
+
+	return st.TransitionDb()
+}
+
 // StateTransition represents a state transition.
 //
 // == The State Transitioning Model
@@ -213,6 +221,11 @@ type StateTransition struct {
 	initialGas   uint64
 	state        vm.StateDB
 	evm          *vm.EVM
+
+	// If true, fee burning and tipping won't happen during transition. Instead, their values will be included in the
+	// ExecutionResult, which caller can use the values to update the balance of burner and coinbase account.
+	// This is useful during parallel state transition, where the common account read/write should be minimized.
+	noFeeBurnAndTip bool
 }
 
 // NewStateTransition initialises and returns a new state transition object.

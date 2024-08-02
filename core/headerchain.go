@@ -70,6 +70,7 @@ type HeaderChain struct {
 
 	procInterrupt func() bool
 	engine        consensus.Engine
+	parallelSpeculativeProcesses int
 }
 
 // NewHeaderChain creates a new HeaderChain structure. ProcInterrupt points
